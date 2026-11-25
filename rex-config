@@ -1,0 +1,177 @@
+#!/usr/bin/env -S python3 -I
+"""Export or import Rex settings, themes and init.lua through this git repo.
+
+  rex-config export   save this Mac's Rex settings and themes here, commit and push
+  rex-config import   pull, then apply the saved settings and themes to this Mac
+  rex-config import --dry-run   show what import would change without applying it
+"""
+import datetime
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DOMAIN = "com.superlogical.rex"
+REPO = Path(__file__).resolve().parent
+SETTINGS = REPO / "settings.json"
+THEMES = REPO / "themes"
+LOG = Path.home() / "Library/Logs/rex-config-import.log"
+
+EXTRA_KEYS = {"RexAppUpdateChannel", "rex.agents.names-sessions", "rex.developer-mode-enabled"}
+SKIP_KEYS = {
+    "Workspace.customThemes",
+    "Workspace.lastFocusedSession",
+    "Workspace.openWindows",
+    "Workspace.programActivitySeen",
+    "Workspace.activityGroupingResetToPriority",
+}
+
+
+def run(*args, check=True, **kw):
+    return subprocess.run(args, check=check, text=True, capture_output=True, **kw)
+
+
+def read_prefs():
+    out = subprocess.run(["defaults", "export", DOMAIN, "-"], check=True, capture_output=True).stdout
+    return plistlib.loads(out)
+
+
+def portable(key, value):
+    if key in SKIP_KEYS:
+        return False
+    if not (key.startswith("Workspace.") or key in EXTRA_KEYS):
+        return False
+    try:
+        json.dumps(value)
+    except TypeError:
+        return False
+    return True
+
+
+def theme_file(theme):
+    slug = "".join(c if c.isalnum() else "-" for c in theme["name"].lower()).strip("-")
+    return THEMES / f"{slug}.json"
+
+
+def git(*args, check=True):
+    return run("git", "-C", str(REPO), *args, check=check)
+
+
+def has_remote():
+    return bool(git("remote", check=False).stdout.strip())
+
+
+def export():
+    prefs = read_prefs()
+    settings = {k: v for k, v in sorted(prefs.items()) if portable(k, v)}
+    SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+
+    themes = json.loads(prefs.get("Workspace.customThemes", b"[]"))
+    THEMES.mkdir(exist_ok=True)
+    keep = set()
+    for theme in themes:
+        theme = {k: v for k, v in theme.items() if k != "createdAt"}
+        path = theme_file(theme)
+        path.write_text(json.dumps(theme, indent=2, sort_keys=True) + "\n")
+        keep.add(path)
+    for old in THEMES.glob("*.json"):
+        if old not in keep:
+            old.unlink()
+    print(f"exported {len(settings)} settings and {len(themes)} themes")
+
+    git("add", "-A")
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        print("nothing changed")
+        return
+    git("commit", "-q", "-m", f"Update Rex config {datetime.date.today()}")
+    print(git("log", "-1", "--stat", "--format=%s").stdout.strip())
+    if has_remote():
+        git("push", "-q")
+        print("pushed")
+
+
+def merged_prefs():
+    prefs = read_prefs()
+    settings = json.loads(SETTINGS.read_text())
+    changes = [(k, prefs.get(k), v) for k, v in settings.items() if prefs.get(k) != v]
+    prefs.update(settings)
+
+    current = json.loads(prefs.get("Workspace.customThemes", b"[]"))
+    by_id = {t["id"]: t for t in current}
+    now = time.time() - 978307200
+    for path in sorted(THEMES.glob("*.json")):
+        theme = json.loads(path.read_text())
+        old = by_id.get(theme["id"])
+        if old is None or {k: v for k, v in old.items() if k != "createdAt"} != theme:
+            changes.append((f"theme {theme['name']}", "missing" if old is None else "different", "saved"))
+        by_id[theme["id"]] = {**theme, "createdAt": (old or {}).get("createdAt", now)}
+    prefs["Workspace.customThemes"] = json.dumps(list(by_id.values()), separators=(",", ":")).encode()
+    return prefs, changes
+
+
+def app_running():
+    return run("pgrep", "-x", "Rex", check=False).returncode == 0
+
+
+def apply_detached(plist_path):
+    log = open(LOG, "a")
+    log.write(f"\n{datetime.datetime.now()} import\n")
+    if app_running():
+        subprocess.run(["osascript", "-e", f'quit app id "{DOMAIN}"'], stdout=log, stderr=log)
+        for _ in range(60):
+            if not app_running():
+                break
+            time.sleep(0.5)
+        else:
+            log.write("Rex did not quit; nothing changed\n")
+            return
+    subprocess.run(["defaults", "import", DOMAIN, plist_path], check=True, stdout=log, stderr=log)
+    subprocess.run(["killall", "cfprefsd"], stdout=log, stderr=log)
+    time.sleep(1)
+    subprocess.run(["open", "-b", DOMAIN], stdout=log, stderr=log)
+    time.sleep(5)
+    subprocess.run(["rex", "config", "reload"], stdout=log, stderr=log)
+    log.write("done\n")
+
+
+def import_(dry_run):
+    if has_remote() and not dry_run:
+        git("pull", "-q", "--ff-only")
+    prefs, changes = merged_prefs()
+    for key, old, new in changes:
+        print(f"{key}: {old!r} -> {new!r}")
+    if not changes:
+        print("settings and themes already match")
+    if dry_run:
+        return
+    if not changes:
+        run("rex", "config", "reload", check=False)
+        print("reloaded init.lua")
+        return
+    plist_path = Path.home() / "Library/Caches/rex-config-import.plist"
+    plist_path.write_bytes(plistlib.dumps(prefs, fmt=plistlib.FMT_BINARY))
+    subprocess.Popen(
+        [sys.executable, "-I", __file__, "--apply", str(plist_path)],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print(f"Rex will quit, take the new settings and reopen. Log: {LOG}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--apply"]:
+        apply_detached(args[1])
+    elif args[:1] == ["export"]:
+        export()
+    elif args[:1] == ["import"]:
+        import_("--dry-run" in args)
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
